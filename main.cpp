@@ -1,7 +1,23 @@
-// Simple one-way throughput & latency tool
+/*
+*  This file is part of OpenAutoCore project.
+*  Copyright (C) 2025 buzzcola3 (Samuel Betak)
+*
+*  OpenAutoCore is free software: you can redistribute it and/or modify
+*  it under the terms of the GNU General Public License as published by
+*  the Free Software Foundation; either version 3 of the License, or
+*  (at your option) any later version.
+
+*  OpenAutoCore is distributed in the hope that it will be useful,
+*  but WITHOUT ANY WARRANTY; without even the implied warranty of
+*  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*  GNU General Public License for more details.
+*
+*  You should have received a copy of the GNU General Public License
+*  along with OpenAutoCore. If not, see <http://www.gnu.org/licenses/>.
+*/
+
 // Measures:
 // - messages per second (A -> B)
-// - average one-way latency from A send to B receive
 #include "capnproto_shm_transport.hpp"
 #include <iostream>
 #include <thread>
