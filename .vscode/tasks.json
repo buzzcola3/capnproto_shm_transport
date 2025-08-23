@@ -1,0 +1,21 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Bazel: build demo",
+      "type": "shell",
+      "command": "bazel",
+      "args": ["build", "-c", "dbg", "//:capnproto_shm_transport_demo"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Bazel: run demo",
+      "type": "shell",
+      "command": "bazel",
+      "args": ["run", "-c", "dbg", "//:capnproto_shm_transport_demo"],
+      "group": "test",
+      "problemMatcher": []
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+module(
+	name = "capnproto_shm_transport",
+	version = "0.0.1",
+)
+
+bazel_dep(name = "capnp-cpp", version = "1.1.0")
+bazel_dep(name = "boost.interprocess", version = "1.83.0")

@@ -1,0 +1,23 @@
+cc_library(
+    name = "capnproto_shm_transport",
+    srcs = [
+        "capnproto_shm_transport.cpp",
+    ],
+    hdrs = [
+        "capnproto_shm_transport.hpp",
+    ],
+    visibility = ["//visibility:public"],
+    copts = ["-std=c++17"],
+    linkopts = ["-pthread"],
+)
+
+cc_binary(
+    name = "capnproto_shm_transport_demo",
+    srcs = ["main.cpp"],
+    deps = [
+        ":capnproto_shm_transport",
+        "@boost.interprocess",
+        ],
+    copts = ["-g"],
+    linkopts = ["-g"],
+)

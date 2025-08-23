@@ -1,0 +1,39 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug demo (bazel-bin)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/bazel-bin/capnproto_shm_transport_demo",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "preLaunchTask": "Bazel: build demo",
+      "setupCommands": [
+        { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true },
+        { "description": "Set disassembly flavor to intel", "text": "-gdb-set disassembly-flavor intel", "ignoreFailures": true }
+      ],
+      "sourceFileMap": {
+        "/proc/self/cwd": "${workspaceFolder}",
+        "${workspaceFolder}": "${workspaceFolder}"
+      }
+    },
+    {
+      "name": "Run demo (bazel run)",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "/usr/bin/bash",
+      "args": ["-lc", "bazel run -c dbg //:capnproto_shm_transport_demo"],
+      "cwd": "${workspaceFolder}",
+      "MIMode": "gdb",
+      "externalConsole": false,
+      "setupCommands": [
+        { "description": "Enable pretty-printing for gdb", "text": "-enable-pretty-printing", "ignoreFailures": true }
+      ]
+    }
+  ]
+}
