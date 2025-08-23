@@ -12,80 +12,51 @@ namespace capnproto_shm_transport {
 // Simple version identifier.
 std::string version();
 
-// A duplex shared-memory message transport using two ring buffers
-// (A->B and B->A) in separate shared memory segments. Messages are
-// framed as [uint32_le length][payload bytes]. Designed to carry
-// Cap'n Proto message bytes (word-aligned recommended), but agnostic
-// to the payload format.
-//
-// Usage:
-//   // Side A:
-//   ShmDuplexTransport t{"my-transport", 1<<20, true};
-//   t.send({data, data+len});
-//   std::vector<uint8_t> msg; t.recv(msg);
-//
-//   // Side B:
-//   ShmDuplexTransport t{"my-transport", 1<<20, false};
-//   ...
-class ShmDuplexTransport {
-public:
-	// Create or open two shared-memory ring buffers with a base name.
-	// If isSideA is true, TX uses "<name>.a2b" and RX uses "<name>.b2a".
-	// Otherwise the opposite.
-	ShmDuplexTransport(const std::string& name,
-										 std::size_t capacityBytes,
-										 bool isSideA,
-										 bool openOrCreate = true,
-										 bool truncateOnCreate = false);
+// A duplex shared-memory transport optimized for fixed-size slots.
+	// Single-producer single-consumer per direction, lock-free with atomics.
+	// Each message occupies exactly one slot of size slotSize bytes (caller must
+	// provide exactly slotSize bytes when sending; receiver returns buffers of that size).
+	// Note: slotCount must be a power of two for optimal performance.
+	class ShmFixedSlotDuplexTransport {
+	public:
+		ShmFixedSlotDuplexTransport(const std::string& name,
+																std::size_t slotSize,
+																std::size_t slotCount,
+																bool isSideA,
+																bool openOrCreate = true,
+																bool truncateOnCreate = false);
 
-	~ShmDuplexTransport();
+		~ShmFixedSlotDuplexTransport();
 
-	ShmDuplexTransport(const ShmDuplexTransport&) = delete;
-	ShmDuplexTransport& operator=(const ShmDuplexTransport&) = delete;
-	ShmDuplexTransport(ShmDuplexTransport&&) noexcept;
-	ShmDuplexTransport& operator=(ShmDuplexTransport&&) noexcept;
+		ShmFixedSlotDuplexTransport(const ShmFixedSlotDuplexTransport&) = delete;
+		ShmFixedSlotDuplexTransport& operator=(const ShmFixedSlotDuplexTransport&) = delete;
+		ShmFixedSlotDuplexTransport(ShmFixedSlotDuplexTransport&&) noexcept;
+		ShmFixedSlotDuplexTransport& operator=(ShmFixedSlotDuplexTransport&&) noexcept;
 
-	// Send a message (blocking). Returns false on timeout or error.
-	bool send(const uint8_t* data, std::size_t len,
-						std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
+		// Send exactly one slot; len must equal slotSize.
+		bool sendSlot(const uint8_t* data,
+									std::size_t len,
+									std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
 
-	// Convenience: send from a byte container
-	bool send(const std::vector<uint8_t>& bytes,
-						std::chrono::milliseconds timeout = std::chrono::milliseconds{-1}) {
-		return send(bytes.data(), bytes.size(), timeout);
-	}
+		// Receive exactly one slot; out will be resized to slotSize.
+		bool recvSlot(std::vector<uint8_t>& out,
+									std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
 
-	// Receive a message (blocking). Returns false on timeout or error.
-	bool recv(std::vector<uint8_t>& out,
-						std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
-
-	// Helpers for Cap'n Proto word buffers (no capnp headers needed)
-	bool sendWords(const void* words, std::size_t wordCount,
-								 std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
-	bool recvWords(std::vector<uint64_t>& outWords,
-								 std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
-
-	// Remove shared memory segments (use with care; typically done on cleanup).
-	static void remove(const std::string& name);
-
-		struct RingStats {
-			std::size_t capacity = 0;
-			std::size_t used = 0; // bytes currently in the ring
-			bool shutdown = false;
+		struct SlotRingStats {
+			std::size_t slotSize{0};
+			std::size_t slotCount{0};
+			std::size_t usedSlots{0};
+			bool shutdown{false};
 		};
+		struct SlotTransportStats { SlotRingStats tx; SlotRingStats rx; };
+		bool getStats(SlotTransportStats& out);
 
-		struct TransportStats {
-			RingStats tx;
-			RingStats rx;
-		};
+		static void remove(const std::string& name); // removes only the fixed-slot segments
 
-		// Collect approximate usage stats for both rings.
-		bool getStats(TransportStats& out);
-
-private:
-	struct Impl;
-	Impl* p_{}; // Pimpl to keep header small and independent of Boost headers.
-};
+	private:
+		struct Impl;
+		Impl* p_{};
+	};
 
 } // namespace capnproto_shm_transport
 
