@@ -1,3 +1,5 @@
-./bazel-bin
-./bazel-out
-./bazel-capnproto_shm_transport
+# Ignore Bazel output directories at repo root
+/bazel-bin/
+/bazel-out/
+/bazel-testlogs/
+/bazel-*/
