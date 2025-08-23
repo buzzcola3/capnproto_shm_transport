@@ -274,5 +274,23 @@ void ShmDuplexTransport::remove(const std::string& name) {
 	bip::shared_memory_object::remove((name + ".b2a").c_str());
 }
 
+bool ShmDuplexTransport::getStats(TransportStats& out) {
+	if (!p_) return false;
+	auto calc = [](ShmLayout lay) -> RingStats {
+		RingStats s{};
+		if (!lay.hdr) return s;
+		bip::scoped_lock<bip::interprocess_mutex> lock(lay.hdr->mtx);
+		s.capacity = lay.hdr->capacity;
+		std::size_t head = lay.hdr->head;
+		std::size_t tail = lay.hdr->tail;
+		s.used = (tail + lay.hdr->capacity - head) % lay.hdr->capacity;
+		s.shutdown = lay.hdr->shutdown;
+		return s;
+	};
+	out.tx = calc(p_->tx);
+	out.rx = calc(p_->rx);
+	return true;
+}
+
 } // namespace capnproto_shm_transport
 

@@ -2,7 +2,7 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Bazel: build demo",
+      "label": "Bazel: build demo (dbg)",
       "type": "shell",
       "command": "bazel",
       "args": ["build", "-c", "dbg", "//:capnproto_shm_transport_demo"],
@@ -10,10 +10,58 @@
       "problemMatcher": []
     },
     {
-      "label": "Bazel: run demo",
+      "label": "Bazel: run demo (dbg)",
       "type": "shell",
       "command": "bazel",
       "args": ["run", "-c", "dbg", "//:capnproto_shm_transport_demo"],
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Bazel: build demo (opt)",
+      "type": "shell",
+      "command": "bazel",
+      "args": ["build", "-c", "opt", "//:capnproto_shm_transport_demo"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Bazel: run demo (opt)",
+      "type": "shell",
+      "command": "bazel",
+      "args": ["run", "-c", "opt", "//:capnproto_shm_transport_demo"],
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Bazel: build demo (fast)",
+      "type": "shell",
+      "command": "bazel",
+      "args": ["build", "--config=fast", "//:capnproto_shm_transport_demo"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Bazel: run demo (fast)",
+      "type": "shell",
+      "command": "bazel",
+      "args": ["run", "--config=fast", "//:capnproto_shm_transport_demo"],
+      "group": "test",
+      "problemMatcher": []
+    },
+    {
+      "label": "Bazel: build demo (ultra)",
+      "type": "shell",
+      "command": "bazel",
+      "args": ["build", "--config=ultra", "//:capnproto_shm_transport_demo"],
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "Bazel: run demo (ultra)",
+      "type": "shell",
+      "command": "bazel",
+      "args": ["run", "--config=ultra", "//:capnproto_shm_transport_demo"],
       "group": "test",
       "problemMatcher": []
     }

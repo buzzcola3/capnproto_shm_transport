@@ -68,6 +68,20 @@ public:
 	// Remove shared memory segments (use with care; typically done on cleanup).
 	static void remove(const std::string& name);
 
+		struct RingStats {
+			std::size_t capacity = 0;
+			std::size_t used = 0; // bytes currently in the ring
+			bool shutdown = false;
+		};
+
+		struct TransportStats {
+			RingStats tx;
+			RingStats rx;
+		};
+
+		// Collect approximate usage stats for both rings.
+		bool getStats(TransportStats& out);
+
 private:
 	struct Impl;
 	Impl* p_{}; // Pimpl to keep header small and independent of Boost headers.

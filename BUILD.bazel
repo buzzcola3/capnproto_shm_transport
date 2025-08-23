@@ -19,6 +19,5 @@ cc_binary(
     name = "capnproto_shm_transport_demo",
     srcs = ["main.cpp"],
     deps = [":capnproto_shm_transport"],
-    copts = ["-g"],
-    linkopts = ["-g", "-pthread", "-lrt"],
+    linkopts = ["-pthread", "-lrt"],
 )
