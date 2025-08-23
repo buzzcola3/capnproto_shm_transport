@@ -11,6 +11,8 @@
 #include <memory>
 #include <new>
 #include <stdexcept>
+#include <algorithm>
+#include <thread>
 
 namespace bip = boost::interprocess;
 
@@ -36,31 +38,24 @@ struct RingHeader {
 };
 
 // Layout in SHM: [RingHeader][padding][byte buffer of size capacity]
-struct ShmLayout {
-	RingHeader* hdr;
-	uint8_t* buf;
-};
+struct ShmLayout { RingHeader* hdr; uint8_t* buf; };
 
 ShmLayout init_or_open_region(bip::managed_shared_memory& shm,
 															std::size_t capacity,
 															bool create) {
-	// Compute total size and placement new the RingHeader only on create.
 	RingHeader* hdr = nullptr;
 	uint8_t* data = nullptr;
 
 	if (create) {
-		hdr = shm.construct<RingHeader>(bip::anonymous_instance)();
+		hdr = shm.construct<RingHeader>("hdr")();
 		hdr->capacity = capacity;
 		hdr->head = 0;
 		hdr->tail = 0;
 		hdr->shutdown = false;
-
-		// Allocate raw bytes for the buffer
-		data = shm.construct<uint8_t>(bip::anonymous_instance)[capacity]();
+		data = shm.construct<uint8_t>("buf")[capacity]();
 	} else {
-		// Find the first RingHeader and data array allocated in this segment
-		std::pair<RingHeader*, std::size_t> hfound = shm.find<RingHeader>(bip::anonymous_instance);
-		std::pair<uint8_t*, std::size_t> dfound = shm.find<uint8_t>(bip::anonymous_instance);
+		auto hfound = shm.find<RingHeader>("hdr");
+		auto dfound = shm.find<uint8_t>("buf");
 		if (!hfound.first || !dfound.first || dfound.second < capacity) {
 			throw std::runtime_error("shared memory region not initialized");
 		}
@@ -82,16 +77,16 @@ bool ring_write(ShmLayout lay, const uint8_t* src, std::size_t len,
 		return (h->capacity - used - 1) >= len; // keep one byte gap
 	};
 
-	if (timeout < std::chrono::milliseconds{0}) {
-		while (!pred_space() && !h->shutdown) h->can_write.wait(lock);
-		if (h->shutdown) return false;
-	} else {
-		auto until = std::chrono::steady_clock::now() + timeout;
-		while (!pred_space() && !h->shutdown) {
-			if (!h->can_write.timed_wait(lock, until)) return false;
-		}
-		if (h->shutdown) return false;
+	auto deadline = (timeout < std::chrono::milliseconds{0})
+											? std::chrono::steady_clock::time_point::max()
+											: std::chrono::steady_clock::now() + timeout;
+	while (!pred_space() && !h->shutdown) {
+		if (std::chrono::steady_clock::now() >= deadline) return false;
+		lock.unlock();
+		std::this_thread::sleep_for(std::chrono::microseconds(200));
+		lock.lock();
 	}
+	if (h->shutdown) return false;
 
 	// Write with wrap-around
 	std::size_t tail = h->tail;
@@ -105,7 +100,7 @@ bool ring_write(ShmLayout lay, const uint8_t* src, std::size_t len,
 }
 
 bool ring_read(ShmLayout lay, uint8_t* dst, std::size_t len,
-							 std::chrono::milliseconds timeout) {
+			   std::chrono::milliseconds timeout) {
 	RingHeader* h = lay.hdr;
 	bip::scoped_lock<bip::interprocess_mutex> lock(h->mtx);
 
@@ -116,16 +111,16 @@ bool ring_read(ShmLayout lay, uint8_t* dst, std::size_t len,
 		return avail >= len;
 	};
 
-	if (timeout < std::chrono::milliseconds{0}) {
-		while (!pred_data() && !h->shutdown) h->can_read.wait(lock);
-		if (h->shutdown) return false;
-	} else {
-		auto until = std::chrono::steady_clock::now() + timeout;
+		auto deadline = (timeout < std::chrono::milliseconds{0})
+												? std::chrono::steady_clock::time_point::max()
+												: std::chrono::steady_clock::now() + timeout;
 		while (!pred_data() && !h->shutdown) {
-			if (!h->can_read.timed_wait(lock, until)) return false;
+			if (std::chrono::steady_clock::now() >= deadline) return false;
+			lock.unlock();
+			std::this_thread::sleep_for(std::chrono::microseconds(200));
+			lock.lock();
 		}
 		if (h->shutdown) return false;
-	}
 
 	// Read with wrap-around
 	std::size_t head = h->head;
@@ -151,39 +146,18 @@ struct ShmDuplexTransport::Impl {
 	ShmLayout tx{};
 	ShmLayout rx{};
 
-	Impl(const std::string& base, std::size_t cap, bool sideA,
-			 bool openOrCreate, bool truncateOnCreate)
+		Impl(const std::string& base, std::size_t cap, bool sideA,
+				 bool openOrCreate, bool truncateOnCreate)
 			: name(base), isA(sideA), capacity(cap) {
 		std::string a2b = base + ".a2b";
 		std::string b2a = base + ".b2a";
 
-		auto mk = [&](const std::string& segName, bool isCreate) {
-			if (openOrCreate) {
-				if (isCreate) {
-					if (truncateOnCreate) bip::shared_memory_object::remove(segName.c_str());
-					return std::make_unique<bip::managed_shared_memory>(bip::create_only, segName.c_str(),
-							std::max<std::size_t>(cap + 1 << 12, cap + 1 << 12));
-				} else {
-					try {
-						return std::make_unique<bip::managed_shared_memory>(bip::open_only, segName.c_str());
-					} catch (...) {
-						// Fallback to create if open fails
-						if (truncateOnCreate) bip::shared_memory_object::remove(segName.c_str());
-						return std::make_unique<bip::managed_shared_memory>(bip::create_only, segName.c_str(),
-								std::max<std::size_t>(cap + 1 << 12, cap + 1 << 12));
-					}
-				}
-			} else {
-				return std::make_unique<bip::managed_shared_memory>(bip::open_only, segName.c_str());
-			}
-		};
-
-		// Size budget: header + buffer. We approximate by reserving cap + overhead.
-		auto create_seg = [&](const std::string& segName) {
-			if (truncateOnCreate) bip::shared_memory_object::remove(segName.c_str());
-			return std::make_unique<bip::managed_shared_memory>(bip::create_only, segName.c_str(),
-					cap + 1 * 1024 * 1024);
-		};
+			// Size budget: header + buffer + small overhead.
+			auto create_seg = [&](const std::string& segName) {
+				if (truncateOnCreate) bip::shared_memory_object::remove(segName.c_str());
+				const std::size_t bytes = sizeof(RingHeader) + capacity + 4096;
+				return std::make_unique<bip::managed_shared_memory>(bip::create_only, segName.c_str(), bytes);
+			};
 
 		// Build both segments. Side A creates if possible.
 		if (isA) {
