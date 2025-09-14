@@ -47,17 +47,20 @@ inline void cpu_relax() {
 #endif
 }
 
+// Control / ring header (fixed POD, validated by magic+abiVersion)
 struct alignas(64) SlotHeader {
+    uint32_t magic{0};        // CAPNPROTO_SHM_TRANSPORT_MAGIC
+    uint32_t abiVersion{0};   // CAPNPROTO_SHM_TRANSPORT_ABI_VERSION
     uint64_t slotSize{0};
     uint64_t slotCount{0};
     uint64_t slotMask{0};
     uint32_t shutdown{0};
     uint32_t ready{0};
-    uint8_t  _pad0[64 - (8+8+8+4+4)]; // fill first cache line (verify positive)
+    uint8_t  pad0[64 - (4+4+8+8+8+4+4)]; // 64 - 40 = 24
     std::atomic<uint64_t> head{0};
-    uint8_t  _pad1[64 - sizeof(std::atomic<uint64_t>)];
+    uint8_t  pad1[64 - sizeof(std::atomic<uint64_t>)];
     std::atomic<uint64_t> tail{0};
-    uint8_t  _pad2[64 - sizeof(std::atomic<uint64_t>)];
+    uint8_t  pad2[64 - sizeof(std::atomic<uint64_t>)];
 };
 static_assert(sizeof(SlotHeader) == 192, "SlotHeader size unexpected");
 
@@ -72,17 +75,30 @@ inline uint64_t slots_used(const SlotHeader* h) {
     return (tail - head) & h->slotMask;
 }
 
+inline void validate_header(const SlotHeader* h) {
+    if (!h ||
+        h->magic != CAPNPROTO_SHM_TRANSPORT_MAGIC ||
+        h->abiVersion != CAPNPROTO_SHM_TRANSPORT_ABI_VERSION ||
+        h->slotCount == 0 ||
+        ((h->slotCount & (h->slotCount - 1)) != 0) ||
+        h->slotMask != (h->slotCount - 1)) {
+        throw std::runtime_error("shared memory header invalid/mismatch");
+    }
+}
+
 SlotLayout create_region(bip::managed_shared_memory& shm,
                          uint64_t slotSize,
                          uint64_t slotCount) {
     if ((slotCount & (slotCount - 1)) != 0)
         throw std::runtime_error("slotCount must be power of two");
     auto* hdr = shm.construct<SlotHeader>("hdr")();
-    hdr->slotSize  = slotSize;
-    hdr->slotCount = slotCount;
-    hdr->slotMask  = slotCount - 1;
-    hdr->shutdown  = 0;
-    hdr->ready     = 0;
+    hdr->magic      = CAPNPROTO_SHM_TRANSPORT_MAGIC;
+    hdr->abiVersion = CAPNPROTO_SHM_TRANSPORT_ABI_VERSION;
+    hdr->slotSize   = slotSize;
+    hdr->slotCount  = slotCount;
+    hdr->slotMask   = slotCount - 1;
+    hdr->shutdown   = 0;
+    hdr->ready      = 0;
     auto* buf = shm.construct<uint8_t>("buf")[slotSize * slotCount]();
     return {hdr, buf};
 }
@@ -92,6 +108,7 @@ SlotLayout open_region(bip::managed_shared_memory& shm) {
     auto dfound = shm.find<uint8_t>("buf");
     if (!hfound.first || !dfound.first)
         throw std::runtime_error("region not initialized yet");
+    validate_header(hfound.first);
     return {hfound.first, dfound.first};
 }
 

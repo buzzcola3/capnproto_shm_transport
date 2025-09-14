@@ -24,7 +24,11 @@
 
 namespace capnproto_shm_transport {
 
-// Each stats block is 64 bytes due to alignas(64).
+// Public ABI / magic (for cross-lib/process validation)
+static constexpr uint32_t CAPNPROTO_SHM_TRANSPORT_MAGIC       = 0x43535431; // 'CST1'
+static constexpr uint32_t CAPNPROTO_SHM_TRANSPORT_ABI_VERSION = 1;
+
+// Each stats block is 64 bytes (cacheline)
 struct alignas(64) SlotRingStats {
     uint64_t slotSize{0};
     uint64_t slotCount{0};
