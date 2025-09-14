@@ -26,6 +26,7 @@
 #include <thread>
 #include <atomic>
 #include <chrono>
+#include <iostream>  // <— added for debug output
 
 #if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
@@ -195,20 +196,64 @@ struct ShmFixedSlotDuplexTransport::Impl {
         std::string a2b = base + ".fs.a2b";
         std::string b2a = base + ".fs.b2a";
         auto deadline = std::chrono::steady_clock::now() + wait;
+        auto start    = std::chrono::steady_clock::now();
+        uint64_t attempts = 0;
+#ifdef CAPNPROTO_SHM_DEBUG
+        std::cerr << "[capnproto_shm_transport] opener waiting for segments: "
+                  << a2b << " & " << b2a << " (timeout "
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(wait).count()
+                  << " ms)" << std::endl;
+#endif
         for (;;) {
+            ++attempts;
             try {
                 seg_rx = std::make_unique<bip::managed_shared_memory>(bip::open_only, a2b.c_str());
                 seg_tx = std::make_unique<bip::managed_shared_memory>(bip::open_only, b2a.c_str());
-                rx = open_region(*seg_rx);
+                rx = open_region(*seg_rx);   // may throw if header invalid / not yet constructed
                 tx = open_region(*seg_tx);
+                // Validate creator published readiness
                 if (rx.hdr->ready && tx.hdr->ready) {
                     slotSize  = rx.hdr->slotSize;
                     slotCount = rx.hdr->slotCount;
+#ifdef CAPNPROTO_SHM_DEBUG
+                    std::cerr << "[capnproto_shm_transport] opener connected after "
+                              << attempts << " attempts ("
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - start).count()
+                              << " ms). slotSize=" << slotSize
+                              << " slotCount=" << slotCount << std::endl;
+#endif
                     return;
                 }
-            } catch (...) {}
-            if (std::chrono::steady_clock::now() >= deadline)
+#ifdef CAPNPROTO_SHM_DEBUG
+                std::cerr << "[capnproto_shm_transport] headers present but not ready yet "
+                          << "(attempt " << attempts << ")" << std::endl;
+#endif
+            } catch (const std::exception& ex) {
+#ifdef CAPNPROTO_SHM_DEBUG
+                // Only log periodically to avoid flooding
+                if ((attempts & 0xFF) == 0) {
+                    std::cerr << "[capnproto_shm_transport] still waiting (attempt "
+                              << attempts << "): " << ex.what() << std::endl;
+                }
+#endif
+            } catch (...) {
+#ifdef CAPNPROTO_SHM_DEBUG
+                if ((attempts & 0xFF) == 0) {
+                    std::cerr << "[capnproto_shm_transport] still waiting (attempt "
+                              << attempts << "): unknown exception" << std::endl;
+                }
+#endif
+            }
+            if (std::chrono::steady_clock::now() >= deadline) {
+#ifdef CAPNPROTO_SHM_DEBUG
+                std::cerr << "[capnproto_shm_transport] TIMEOUT opening shared memory transport after "
+                          << attempts << " attempts. Last state:"
+                          << " rx_seg=" << a2b
+                          << " tx_seg=" << b2a << std::endl;
+#endif
                 throw std::runtime_error("timeout opening shared memory transport");
+            }
             cpu_relax();
         }
     }
