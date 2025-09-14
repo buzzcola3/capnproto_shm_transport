@@ -32,6 +32,8 @@
 #include <immintrin.h>
 #endif
 
+#define CAPNPROTO_SHM_DEBUG
+
 namespace bip = boost::interprocess;
 
 namespace capnproto_shm_transport {
