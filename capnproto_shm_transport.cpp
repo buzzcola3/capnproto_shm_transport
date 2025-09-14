@@ -52,14 +52,14 @@ inline void cpu_relax() {
 
 // Control / ring header (fixed POD, validated by magic+abiVersion)
 struct alignas(64) SlotHeader {
-    uint32_t magic{0};        // CAPNPROTO_SHM_TRANSPORT_MAGIC
-    uint32_t abiVersion{0};   // CAPNPROTO_SHM_TRANSPORT_ABI_VERSION
+    uint32_t magic{0};
+    uint32_t abiVersion{0};
     uint64_t slotSize{0};
     uint64_t slotCount{0};
     uint64_t slotMask{0};
-    uint32_t shutdown{0};
-    uint32_t ready{0};
-    uint8_t  pad0[64 - (4+4+8+8+8+4+4)]; // 64 - 40 = 24
+    std::atomic<uint32_t> shutdown{0};
+    std::atomic<uint32_t> ready{0};
+    uint8_t  pad0[64 - (4+4+8+8+8+4+4)]; // 24 bytes
     std::atomic<uint64_t> head{0};
     uint8_t  pad1[64 - sizeof(std::atomic<uint64_t>)];
     std::atomic<uint64_t> tail{0};
@@ -100,8 +100,8 @@ SlotLayout create_region(bip::managed_shared_memory& shm,
     hdr->slotSize   = slotSize;
     hdr->slotCount  = slotCount;
     hdr->slotMask   = slotCount - 1;
-    hdr->shutdown   = 0;
-    hdr->ready      = 0;
+    hdr->shutdown.store(0, std::memory_order_relaxed);
+    hdr->ready.store(0, std::memory_order_relaxed);
     auto* buf = shm.construct<uint8_t>("buf")[slotSize * slotCount]();
     return {hdr, buf};
 }
@@ -130,7 +130,7 @@ uint32_t slot_write(SlotLayout lay, const uint8_t* src,
             h->tail.store(tail + 1, std::memory_order_release);
             return 1;
         }
-        if (h->shutdown) return 0;
+        if (h->shutdown.load(std::memory_order_relaxed)) return 0;
         if (std::chrono::steady_clock::now() >= deadline) return 0;
         cpu_relax();
     }
@@ -151,7 +151,7 @@ uint32_t slot_read(SlotLayout lay, uint8_t* dst,
             h->head.store(head + 1, std::memory_order_release);
             return 1;
         }
-        if (h->shutdown) return 0;
+        if (h->shutdown.load(std::memory_order_relaxed)) return 0;
         if (std::chrono::steady_clock::now() >= deadline) return 0;
         cpu_relax();
     }
@@ -188,8 +188,8 @@ struct ShmFixedSlotDuplexTransport::Impl {
                                                               alloc_bytes(sSize * sCount));
         tx = create_region(*seg_tx, slotSize, slotCount);
         rx = create_region(*seg_rx, slotSize, slotCount);
-        tx.hdr->ready = 1;
-        rx.hdr->ready = 1;
+        tx.hdr->ready.store(1, std::memory_order_release);
+        rx.hdr->ready.store(1, std::memory_order_release);
     }
 
     Impl(const std::string& base,
@@ -198,61 +198,80 @@ struct ShmFixedSlotDuplexTransport::Impl {
         std::string a2b = base + ".fs.a2b";
         std::string b2a = base + ".fs.b2a";
         auto deadline = std::chrono::steady_clock::now() + wait;
-        auto start    = std::chrono::steady_clock::now();
+        auto firstSeen = std::chrono::steady_clock::time_point{};
         uint64_t attempts = 0;
+        const auto stale_ms = std::chrono::milliseconds(1500);
 #ifdef CAPNPROTO_SHM_DEBUG
-        std::cerr << "[capnproto_shm_transport] opener waiting for segments: "
-                  << a2b << " & " << b2a << " (timeout "
+        std::cerr << "[capnproto_shm_transport] opener waiting: " << a2b
+                  << " & " << b2a << " timeout="
                   << std::chrono::duration_cast<std::chrono::milliseconds>(wait).count()
-                  << " ms)" << std::endl;
+                  << "ms" << std::endl;
 #endif
         for (;;) {
             ++attempts;
+            bool bothMapped = false;
             try {
                 seg_rx = std::make_unique<bip::managed_shared_memory>(bip::open_only, a2b.c_str());
                 seg_tx = std::make_unique<bip::managed_shared_memory>(bip::open_only, b2a.c_str());
-                rx = open_region(*seg_rx);   // may throw if header invalid / not yet constructed
+                rx = open_region(*seg_rx);
                 tx = open_region(*seg_tx);
-                // Validate creator published readiness
-                if (rx.hdr->ready && tx.hdr->ready) {
-                    slotSize  = rx.hdr->slotSize;
-                    slotCount = rx.hdr->slotCount;
-#ifdef CAPNPROTO_SHM_DEBUG
-                    std::cerr << "[capnproto_shm_transport] opener connected after "
-                              << attempts << " attempts ("
-                              << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::steady_clock::now() - start).count()
-                              << " ms). slotSize=" << slotSize
-                              << " slotCount=" << slotCount << std::endl;
-#endif
-                    return;
-                }
-#ifdef CAPNPROTO_SHM_DEBUG
-                std::cerr << "[capnproto_shm_transport] headers present but not ready yet "
-                          << "(attempt " << attempts << ")" << std::endl;
-#endif
+                bothMapped = true;
             } catch (const std::exception& ex) {
 #ifdef CAPNPROTO_SHM_DEBUG
-                // Only log periodically to avoid flooding
                 if ((attempts & 0xFF) == 0) {
-                    std::cerr << "[capnproto_shm_transport] still waiting (attempt "
-                              << attempts << "): " << ex.what() << std::endl;
+                    std::cerr << "[capnproto_shm_transport] attempt=" << attempts
+                              << " map failed: " << ex.what() << std::endl;
                 }
 #endif
             } catch (...) {
 #ifdef CAPNPROTO_SHM_DEBUG
                 if ((attempts & 0xFF) == 0) {
-                    std::cerr << "[capnproto_shm_transport] still waiting (attempt "
-                              << attempts << "): unknown exception" << std::endl;
+                    std::cerr << "[capnproto_shm_transport] attempt=" << attempts
+                              << " map failed: unknown" << std::endl;
                 }
 #endif
             }
+
+            if (bothMapped) {
+                if (firstSeen == std::chrono::steady_clock::time_point{})
+                    firstSeen = std::chrono::steady_clock::now();
+
+                uint32_t r1 = rx.hdr->ready.load(std::memory_order_acquire);
+                uint32_t r2 = tx.hdr->ready.load(std::memory_order_acquire);
+
+                if (r1 && r2) {
+                    slotSize  = rx.hdr->slotSize;
+                    slotCount = rx.hdr->slotCount;
+#ifdef CAPNPROTO_SHM_DEBUG
+                    std::cerr << "[capnproto_shm_transport] connected after attempts="
+                              << attempts << " slotSize=" << slotSize
+                              << " slotCount=" << slotCount << std::endl;
+#endif
+                    return;
+                }
+
+                // Stale detection
+                if (firstSeen != std::chrono::steady_clock::time_point{} &&
+                    (std::chrono::steady_clock::now() - firstSeen) > stale_ms) {
+#ifdef CAPNPROTO_SHM_DEBUG
+                    std::cerr << "[capnproto_shm_transport] stale header: ready bits never set "
+                              << "(r1=" << r1 << ", r2=" << r2 << ") aborting" << std::endl;
+#endif
+                    throw std::runtime_error("stale shared memory header (ready bits never set)");
+                }
+
+#ifdef CAPNPROTO_SHM_DEBUG
+                if ((attempts & 0xFF) == 0) {
+                    std::cerr << "[capnproto_shm_transport] waiting ready r1=" << r1
+                              << " r2=" << r2 << " attempts=" << attempts << std::endl;
+                }
+#endif
+            }
+
             if (std::chrono::steady_clock::now() >= deadline) {
 #ifdef CAPNPROTO_SHM_DEBUG
-                std::cerr << "[capnproto_shm_transport] TIMEOUT opening shared memory transport after "
-                          << attempts << " attempts. Last state:"
-                          << " rx_seg=" << a2b
-                          << " tx_seg=" << b2a << std::endl;
+                std::cerr << "[capnproto_shm_transport] TIMEOUT attempts=" << attempts
+                          << " mapped=" << (bothMapped ? 1 : 0) << std::endl;
 #endif
                 throw std::runtime_error("timeout opening shared memory transport");
             }
@@ -261,8 +280,8 @@ struct ShmFixedSlotDuplexTransport::Impl {
     }
 
     ~Impl() {
-        if (tx.hdr) tx.hdr->shutdown = 1;
-        if (rx.hdr) rx.hdr->shutdown = 1;
+        if (tx.hdr) tx.hdr->shutdown.store(1, std::memory_order_relaxed);
+        if (rx.hdr) rx.hdr->shutdown.store(1, std::memory_order_relaxed);
     }
 };
 
