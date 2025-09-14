@@ -17,8 +17,6 @@
 */
 
 #pragma once
-
-#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -26,50 +24,54 @@
 
 namespace capnproto_shm_transport {
 
-struct SlotRingStats {
-    std::size_t slotSize{0};
-    std::size_t slotCount{0};
-    std::size_t usedSlots{0};
-    bool shutdown{false};
+// Each stats block is 64 bytes due to alignas(64).
+struct alignas(64) SlotRingStats {
+    uint64_t slotSize{0};
+    uint64_t slotCount{0};
+    uint64_t usedSlots{0};
+    uint32_t shutdown{0};
+    uint32_t _pad{0};
+    uint64_t _rsv0{0};
+    uint64_t _rsv1{0};
 };
+static_assert(sizeof(SlotRingStats) == 64, "SlotRingStats size unexpected");
 
-struct SlotTransportStats {
+struct alignas(64) SlotTransportStats {
     SlotRingStats tx;
     SlotRingStats rx;
 };
+static_assert(sizeof(SlotTransportStats) == 128, "SlotTransportStats size unexpected");
 
 class ShmFixedSlotDuplexTransport {
 public:
-    // Creator (Side A): creates both directions. slotCount must be power of two.
     ShmFixedSlotDuplexTransport(const std::string& name,
-                                std::size_t slotSize,
-                                std::size_t slotCount,
-                                bool truncateOnCreate = true);
+                                uint64_t slotSize,
+                                uint64_t slotCount,
+                                uint32_t truncateOnCreate = 1);
 
-    // Open existing (Side B): waits (spin) until creator published headers or timeout.
     static ShmFixedSlotDuplexTransport open(const std::string& name,
-                                            std::chrono::milliseconds wait = std::chrono::milliseconds{5000});
+        std::chrono::milliseconds wait = std::chrono::milliseconds{5000});
 
     ShmFixedSlotDuplexTransport(ShmFixedSlotDuplexTransport&&) noexcept;
     ShmFixedSlotDuplexTransport& operator=(ShmFixedSlotDuplexTransport&&) noexcept;
     ~ShmFixedSlotDuplexTransport();
 
-    bool sendSlot(const uint8_t* data, std::size_t len,
-                  std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
-    bool recvSlot(std::vector<uint8_t>& out,
-                  std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
+    uint32_t sendSlot(const uint8_t* data, uint64_t len,
+                      std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
+    uint32_t recvSlot(std::vector<uint8_t>& out,
+                      std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
 
-    bool getStats(SlotTransportStats& out);
+    uint32_t getStats(SlotTransportStats& out);
 
-    std::size_t slotSize()  const noexcept;
-    std::size_t slotCount() const noexcept;
-    bool isCreator() const noexcept;
+    uint64_t slotSize()  const noexcept;
+    uint64_t slotCount() const noexcept;
+    uint32_t isCreator() const noexcept;
 
     static void remove(const std::string& name);
 
 private:
     struct Impl;
-    explicit ShmFixedSlotDuplexTransport(Impl* impl); // used by open()
+    explicit ShmFixedSlotDuplexTransport(Impl* impl);
     Impl* p_{nullptr};
 };
 

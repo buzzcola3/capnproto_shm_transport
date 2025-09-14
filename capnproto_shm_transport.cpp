@@ -48,38 +48,41 @@ inline void cpu_relax() {
 }
 
 struct alignas(64) SlotHeader {
-    std::size_t slotSize{0};
-    std::size_t slotCount{0};
-    std::size_t slotMask{0};
-    std::atomic<std::size_t> head{0};
-    char pad0[64 - sizeof(std::atomic<std::size_t>) % 64];
-    std::atomic<std::size_t> tail{0};
-    char pad1[64 - sizeof(std::atomic<std::size_t>) % 64];
-    std::atomic<bool> shutdown{false};
-    std::atomic<bool> ready{false}; // published when creator finishes init
+    uint64_t slotSize{0};
+    uint64_t slotCount{0};
+    uint64_t slotMask{0};
+    uint32_t shutdown{0};
+    uint32_t ready{0};
+    uint8_t  _pad0[64 - (8+8+8+4+4)]; // fill first cache line (verify positive)
+    std::atomic<uint64_t> head{0};
+    uint8_t  _pad1[64 - sizeof(std::atomic<uint64_t>)];
+    std::atomic<uint64_t> tail{0};
+    uint8_t  _pad2[64 - sizeof(std::atomic<uint64_t>)];
+};
+static_assert(sizeof(SlotHeader) == 192, "SlotHeader size unexpected");
+
+struct SlotLayout {
+    SlotHeader* hdr{nullptr};
+    uint8_t*    buf{nullptr};
 };
 
-struct SlotLayout { SlotHeader* hdr{nullptr}; uint8_t* buf{nullptr}; };
-
-inline std::size_t slots_used(const SlotHeader* h) {
+inline uint64_t slots_used(const SlotHeader* h) {
     auto head = h->head.load(std::memory_order_relaxed);
     auto tail = h->tail.load(std::memory_order_relaxed);
     return (tail - head) & h->slotMask;
 }
 
 SlotLayout create_region(bip::managed_shared_memory& shm,
-                         std::size_t slotSize,
-                         std::size_t slotCount) {
+                         uint64_t slotSize,
+                         uint64_t slotCount) {
     if ((slotCount & (slotCount - 1)) != 0)
         throw std::runtime_error("slotCount must be power of two");
     auto* hdr = shm.construct<SlotHeader>("hdr")();
     hdr->slotSize  = slotSize;
     hdr->slotCount = slotCount;
     hdr->slotMask  = slotCount - 1;
-    hdr->head.store(0, std::memory_order_relaxed);
-    hdr->tail.store(0, std::memory_order_relaxed);
-    hdr->shutdown.store(false, std::memory_order_relaxed);
-    hdr->ready.store(false, std::memory_order_relaxed);
+    hdr->shutdown  = 0;
+    hdr->ready     = 0;
     auto* buf = shm.construct<uint8_t>("buf")[slotSize * slotCount]();
     return {hdr, buf};
 }
@@ -92,8 +95,8 @@ SlotLayout open_region(bip::managed_shared_memory& shm) {
     return {hfound.first, dfound.first};
 }
 
-bool slot_write(SlotLayout lay, const uint8_t* src,
-                std::chrono::milliseconds timeout) {
+uint32_t slot_write(SlotLayout lay, const uint8_t* src,
+                    std::chrono::milliseconds timeout) {
     auto* h = lay.hdr;
     auto deadline = (timeout < std::chrono::milliseconds{0})
         ? std::chrono::steady_clock::time_point::max()
@@ -102,19 +105,19 @@ bool slot_write(SlotLayout lay, const uint8_t* src,
         auto head = h->head.load(std::memory_order_acquire);
         auto tail = h->tail.load(std::memory_order_relaxed);
         if (((tail - head) & h->slotMask) != h->slotMask) {
-            std::size_t idx = tail & h->slotMask;
+            uint64_t idx = tail & h->slotMask;
             std::memcpy(lay.buf + idx * h->slotSize, src, h->slotSize);
             h->tail.store(tail + 1, std::memory_order_release);
-            return true;
+            return 1;
         }
-        if (h->shutdown.load(std::memory_order_relaxed)) return false;
-        if (std::chrono::steady_clock::now() >= deadline) return false;
+        if (h->shutdown) return 0;
+        if (std::chrono::steady_clock::now() >= deadline) return 0;
         cpu_relax();
     }
 }
 
-bool slot_read(SlotLayout lay, uint8_t* dst,
-               std::chrono::milliseconds timeout) {
+uint32_t slot_read(SlotLayout lay, uint8_t* dst,
+                   std::chrono::milliseconds timeout) {
     auto* h = lay.hdr;
     auto deadline = (timeout < std::chrono::milliseconds{0})
         ? std::chrono::steady_clock::time_point::max()
@@ -123,13 +126,13 @@ bool slot_read(SlotLayout lay, uint8_t* dst,
         auto head = h->head.load(std::memory_order_relaxed);
         auto tail = h->tail.load(std::memory_order_acquire);
         if (((tail - head) & h->slotMask) != 0) {
-            std::size_t idx = head & h->slotMask;
+            uint64_t idx = head & h->slotMask;
             std::memcpy(dst, lay.buf + idx * h->slotSize, h->slotSize);
             h->head.store(head + 1, std::memory_order_release);
-            return true;
+            return 1;
         }
-        if (h->shutdown.load(std::memory_order_relaxed)) return false;
-        if (std::chrono::steady_clock::now() >= deadline) return false;
+        if (h->shutdown) return 0;
+        if (std::chrono::steady_clock::now() >= deadline) return 0;
         cpu_relax();
     }
 }
@@ -137,29 +140,27 @@ bool slot_read(SlotLayout lay, uint8_t* dst,
 
 struct ShmFixedSlotDuplexTransport::Impl {
     std::string name;
-    bool creator{false};
-    std::size_t slotSize{0};
-    std::size_t slotCount{0};
+    uint32_t creator{0};
+    uint64_t slotSize{0};
+    uint64_t slotCount{0};
     std::unique_ptr<bip::managed_shared_memory> seg_tx;
     std::unique_ptr<bip::managed_shared_memory> seg_rx;
     SlotLayout tx{};
     SlotLayout rx{};
 
-    // Creator
     Impl(const std::string& base,
-         std::size_t sSize,
-         std::size_t sCount,
-         bool truncate) : name(base), creator(true),
-                          slotSize(sSize), slotCount(sCount) {
+         uint64_t sSize,
+         uint64_t sCount,
+         uint32_t truncate) : name(base), creator(1),
+                              slotSize(sSize), slotCount(sCount) {
         std::string a2b = base + ".fs.a2b";
         std::string b2a = base + ".fs.b2a";
         if (truncate) {
             bip::shared_memory_object::remove(a2b.c_str());
             bip::shared_memory_object::remove(b2a.c_str());
         }
-        auto alloc_bytes = [&](std::size_t sz) {
-            // header + payload + slack
-            return sizeof(SlotHeader) + sSize * sCount + 4096;
+        auto alloc_bytes = [&](uint64_t) {
+            return static_cast<uint64_t>(sizeof(SlotHeader)) + sSize * sCount + 4096;
         };
         seg_tx = std::make_unique<bip::managed_shared_memory>(bip::create_only, a2b.c_str(),
                                                               alloc_bytes(sSize * sCount));
@@ -167,15 +168,13 @@ struct ShmFixedSlotDuplexTransport::Impl {
                                                               alloc_bytes(sSize * sCount));
         tx = create_region(*seg_tx, slotSize, slotCount);
         rx = create_region(*seg_rx, slotSize, slotCount);
-        // Publish headers ready
-        tx.hdr->ready.store(true, std::memory_order_release);
-        rx.hdr->ready.store(true, std::memory_order_release);
+        tx.hdr->ready = 1;
+        rx.hdr->ready = 1;
     }
 
-    // Opener (Side B)
     Impl(const std::string& base,
          std::chrono::milliseconds wait)
-         : name(base), creator(false) {
+         : name(base), creator(0) {
         std::string a2b = base + ".fs.a2b";
         std::string b2a = base + ".fs.b2a";
         auto deadline = std::chrono::steady_clock::now() + wait;
@@ -185,16 +184,12 @@ struct ShmFixedSlotDuplexTransport::Impl {
                 seg_tx = std::make_unique<bip::managed_shared_memory>(bip::open_only, b2a.c_str());
                 rx = open_region(*seg_rx);
                 tx = open_region(*seg_tx);
-                // Wait until creator published sizes
-                if (rx.hdr->ready.load(std::memory_order_acquire) &&
-                    tx.hdr->ready.load(std::memory_order_acquire)) {
+                if (rx.hdr->ready && tx.hdr->ready) {
                     slotSize  = rx.hdr->slotSize;
                     slotCount = rx.hdr->slotCount;
                     return;
                 }
-            } catch (...) {
-                // ignore until timeout
-            }
+            } catch (...) {}
             if (std::chrono::steady_clock::now() >= deadline)
                 throw std::runtime_error("timeout opening shared memory transport");
             cpu_relax();
@@ -202,17 +197,16 @@ struct ShmFixedSlotDuplexTransport::Impl {
     }
 
     ~Impl() {
-        for (auto lay : {tx, rx}) {
-            if (lay.hdr) lay.hdr->shutdown.store(true, std::memory_order_relaxed);
-        }
+        if (tx.hdr) tx.hdr->shutdown = 1;
+        if (rx.hdr) rx.hdr->shutdown = 1;
     }
 };
 
-// Creator constructor
+// Creator
 ShmFixedSlotDuplexTransport::ShmFixedSlotDuplexTransport(const std::string& name,
-                                                         std::size_t slotSize,
-                                                         std::size_t slotCount,
-                                                         bool truncateOnCreate)
+                                                         uint64_t slotSize,
+                                                         uint64_t slotCount,
+                                                         uint32_t truncateOnCreate)
     : p_(new Impl(name, slotSize, slotCount, truncateOnCreate)) {}
 
 ShmFixedSlotDuplexTransport::ShmFixedSlotDuplexTransport(Impl* impl) : p_(impl) {}
@@ -233,45 +227,45 @@ ShmFixedSlotDuplexTransport::operator=(ShmFixedSlotDuplexTransport&& o) noexcept
     return *this;
 }
 
-bool ShmFixedSlotDuplexTransport::sendSlot(const uint8_t* data,
-                                           std::size_t len,
-                                           std::chrono::milliseconds timeout) {
-    if (!p_ || !data) return false;
-    if (len != p_->slotSize) return false;
+uint32_t ShmFixedSlotDuplexTransport::sendSlot(const uint8_t* data,
+                                               uint64_t len,
+                                               std::chrono::milliseconds timeout) {
+    if (!p_ || !data) return 0;
+    if (len != p_->slotSize) return 0;
     return slot_write(p_->tx, data, timeout);
 }
 
-bool ShmFixedSlotDuplexTransport::recvSlot(std::vector<uint8_t>& out,
-                                           std::chrono::milliseconds timeout) {
-    if (!p_) return false;
+uint32_t ShmFixedSlotDuplexTransport::recvSlot(std::vector<uint8_t>& out,
+                                               std::chrono::milliseconds timeout) {
+    if (!p_) return 0;
     out.resize(p_->slotSize);
     return slot_read(p_->rx, out.data(), timeout);
 }
 
-bool ShmFixedSlotDuplexTransport::getStats(SlotTransportStats& out) {
-    if (!p_) return false;
+uint32_t ShmFixedSlotDuplexTransport::getStats(SlotTransportStats& out) {
+    if (!p_) return 0;
     auto calc = [](SlotLayout lay) {
         SlotRingStats s{};
         if (!lay.hdr) return s;
         s.slotSize  = lay.hdr->slotSize;
         s.slotCount = lay.hdr->slotCount;
         s.usedSlots = slots_used(lay.hdr);
-        s.shutdown  = lay.hdr->shutdown.load(std::memory_order_relaxed);
+        s.shutdown  = lay.hdr->shutdown;
         return s;
     };
     out.tx = calc(p_->tx);
     out.rx = calc(p_->rx);
-    return true;
+    return 1;
 }
 
-std::size_t ShmFixedSlotDuplexTransport::slotSize() const noexcept {
+uint64_t ShmFixedSlotDuplexTransport::slotSize() const noexcept {
     return p_ ? p_->slotSize : 0;
 }
-std::size_t ShmFixedSlotDuplexTransport::slotCount() const noexcept {
+uint64_t ShmFixedSlotDuplexTransport::slotCount() const noexcept {
     return p_ ? p_->slotCount : 0;
 }
-bool ShmFixedSlotDuplexTransport::isCreator() const noexcept {
-    return p_ ? p_->creator : false;
+uint32_t ShmFixedSlotDuplexTransport::isCreator() const noexcept {
+    return p_ ? p_->creator : 0;
 }
 
 void ShmFixedSlotDuplexTransport::remove(const std::string& name) {
