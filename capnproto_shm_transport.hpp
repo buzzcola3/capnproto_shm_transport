@@ -17,53 +17,57 @@
 */
 
 #pragma once
+#include <functional>
+#include <chrono>
+#include <vector>
 #include <cstdint>
 #include <string>
-#include <vector>
-#include <chrono>
 
 namespace capnproto_shm_transport {
-
-// Each stats block is 64 bytes due to alignas(64).
-struct alignas(64) SlotRingStats {
-    uint64_t slotSize{0};
-    uint64_t slotCount{0};
-    uint64_t usedSlots{0};
-    uint32_t shutdown{0};
-    uint32_t _pad{0};
-    uint64_t _rsv0{0};
-    uint64_t _rsv1{0};
-};
-static_assert(sizeof(SlotRingStats) == 64, "SlotRingStats size unexpected");
-
-struct alignas(64) SlotTransportStats {
-    SlotRingStats tx;
-    SlotRingStats rx;
-};
-static_assert(sizeof(SlotTransportStats) == 128, "SlotTransportStats size unexpected");
 
 class ShmFixedSlotDuplexTransport {
 public:
     ShmFixedSlotDuplexTransport(const std::string& name,
                                 uint64_t slotSize,
                                 uint64_t slotCount,
-                                uint32_t truncateOnCreate = 1);
+                                uint32_t truncateOnCreate,
+                                std::function<void(const uint8_t*, uint64_t)> callback,
+                                std::chrono::microseconds pollInterval = std::chrono::milliseconds(1));
 
+    // Open existing (wait up to timeout). Starts background receive if callback provided.
     static ShmFixedSlotDuplexTransport open(const std::string& name,
-        std::chrono::milliseconds wait = std::chrono::milliseconds{5000});
+                                            std::chrono::milliseconds wait,
+                                            std::function<void(const uint8_t*, uint64_t)> callback,
+                                            std::chrono::microseconds pollInterval = std::chrono::milliseconds(1));
+
+    // Helper without callback (no background receive).
+    static ShmFixedSlotDuplexTransport open(const std::string& name,
+                                            std::chrono::milliseconds wait) {
+        return open(name, wait, nullptr);
+    }
 
     ShmFixedSlotDuplexTransport(ShmFixedSlotDuplexTransport&&) noexcept;
     ShmFixedSlotDuplexTransport& operator=(ShmFixedSlotDuplexTransport&&) noexcept;
     ~ShmFixedSlotDuplexTransport();
 
-    uint32_t sendSlot(const uint8_t* data, uint64_t len,
-                      std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
+    uint32_t sendSlot(const uint8_t* data,
+                      uint64_t len,
+                      std::chrono::milliseconds timeout);
     uint32_t recvSlot(std::vector<uint8_t>& out,
-                      std::chrono::milliseconds timeout = std::chrono::milliseconds{-1});
+                      std::chrono::milliseconds timeout);
 
+    struct SlotRingStats {
+        uint64_t slotSize{0};
+        uint64_t slotCount{0};
+        uint64_t usedSlots{0};
+        uint32_t shutdown{0};
+    };
+    struct SlotTransportStats {
+        SlotRingStats tx;
+        SlotRingStats rx;
+    };
     uint32_t getStats(SlotTransportStats& out);
-
-    uint64_t slotSize()  const noexcept;
+    uint64_t slotSize() const noexcept;
     uint64_t slotCount() const noexcept;
     uint32_t isCreator() const noexcept;
 

@@ -10,7 +10,7 @@ cc_library(
     copts = ["-std=c++17"],
     linkopts = ["-pthread"],
     deps = [
-#        "@capnp-cpp",
+        "@boost.asio",
         "@boost.interprocess",
     ],
 )

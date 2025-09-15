@@ -1,43 +1,11 @@
-# Aggressive performance config
-build:fast --compilation_mode=opt
-build:fast --copt=-Ofast
-build:fast --copt=-march=native
-build:fast --copt=-mtune=native
-build:fast --copt=-fstrict-aliasing
-build:fast --copt=-fno-plt
-build:fast --linkopt=-flto
-build:fast --linkopt=-Wl,-O3
-build:fast --strip=always
+# Default: selected glibc toolchain
+build --extra_toolchains=@zig_sdk//toolchain:linux_amd64_gnu.2.31
 
-# Apply same to C++-specific opts
-build:fast --cxxopt=-Ofast
-build:fast --cxxopt=-march=native
-build:fast --cxxopt=-mtune=native
-build:fast --cxxopt=-fstrict-aliasing
-build:fast --cxxopt=-fno-plt
+build:musl --platforms=@zig_sdk//platform:linux_amd64
+build:musl --extra_toolchains=@zig_sdk//toolchain:linux_amd64_musl
 
-# Ultra-aggressive profile (may sacrifice portability/precision)
-build:ultra --compilation_mode=opt
-build:ultra --copt=-Ofast
-build:ultra --copt=-ffast-math
-build:ultra --copt=-funroll-loops
-build:ultra --copt=-fstrict-aliasing
-build:ultra --copt=-fomit-frame-pointer
-build:ultra --copt=-march=native
-build:ultra --copt=-mtune=native
-build:ultra --copt=-fno-plt
-build:ultra --copt=-DNDEBUG
-build:ultra --cxxopt=-Ofast
-build:ultra --cxxopt=-ffast-math
-build:ultra --cxxopt=-funroll-loops
-build:ultra --cxxopt=-fstrict-aliasing
-build:ultra --cxxopt=-fomit-frame-pointer
-build:ultra --cxxopt=-march=native
-build:ultra --cxxopt=-mtune=native
-build:ultra --cxxopt=-fno-plt
-build:ultra --cxxopt=-DNDEBUG
-build:ultra --linkopt=-flto=thin
-build:ultra --linkopt=-Wl,-O3
-build:ultra --linkopt=-Wl,--as-needed
-build:ultra --linkopt=-Wl,--gc-sections
-build:ultra --strip=always
+build:profile --compilation_mode=opt
+build:profile --copt=-O2
+build:profile --copt=-g
+build:profile --copt=-fno-omit-frame-pointer
+build:profile --strip=never
