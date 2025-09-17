@@ -30,31 +30,28 @@ public:
     ShmFixedSlotDuplexTransport(const std::string& name,
                                 uint64_t slotSize,
                                 uint64_t slotCount,
-                                uint32_t truncateOnCreate,
                                 std::function<void(const uint8_t*, uint64_t)> callback,
-                                std::chrono::microseconds pollInterval = std::chrono::milliseconds(1));
+                                std::chrono::microseconds initialPoll = std::chrono::milliseconds(1));
 
-    // Open existing (wait up to timeout). Starts background receive if callback provided.
     static ShmFixedSlotDuplexTransport open(const std::string& name,
                                             std::chrono::milliseconds wait,
                                             std::function<void(const uint8_t*, uint64_t)> callback,
-                                            std::chrono::microseconds pollInterval = std::chrono::milliseconds(1));
+                                            std::chrono::microseconds initialPoll = std::chrono::milliseconds(1));
 
-    // Helper without callback (no background receive).
     static ShmFixedSlotDuplexTransport open(const std::string& name,
                                             std::chrono::milliseconds wait) {
         return open(name, wait, nullptr);
     }
 
+    // Move-only
+    ~ShmFixedSlotDuplexTransport();
     ShmFixedSlotDuplexTransport(ShmFixedSlotDuplexTransport&&) noexcept;
     ShmFixedSlotDuplexTransport& operator=(ShmFixedSlotDuplexTransport&&) noexcept;
-    ~ShmFixedSlotDuplexTransport();
+    ShmFixedSlotDuplexTransport(const ShmFixedSlotDuplexTransport&) = delete;
+    ShmFixedSlotDuplexTransport& operator=(const ShmFixedSlotDuplexTransport&) = delete;
 
-    uint32_t sendSlot(const uint8_t* data,
-                      uint64_t len,
-                      std::chrono::milliseconds timeout);
-    uint32_t recvSlot(std::vector<uint8_t>& out,
-                      std::chrono::milliseconds timeout);
+    uint32_t sendSlot(const uint8_t* data, uint64_t len, std::chrono::milliseconds timeout);
+    uint32_t recvSlot(std::vector<uint8_t>& out, std::chrono::milliseconds timeout);
 
     struct SlotRingStats {
         uint64_t slotSize{0};
@@ -62,14 +59,17 @@ public:
         uint64_t usedSlots{0};
         uint32_t shutdown{0};
     };
-    struct SlotTransportStats {
-        SlotRingStats tx;
-        SlotRingStats rx;
-    };
+    struct SlotTransportStats { SlotRingStats tx; SlotRingStats rx; };
     uint32_t getStats(SlotTransportStats& out);
-    uint64_t slotSize() const noexcept;
+
+    uint64_t slotSize()  const noexcept;
     uint64_t slotCount() const noexcept;
     uint32_t isCreator() const noexcept;
+
+    void setLocalSidePollInterval(std::chrono::microseconds us);
+    void setRemoteSidePollInterval(std::chrono::microseconds us);
+    std::chrono::microseconds getLocalSidePollInterval()  const;
+    std::chrono::microseconds getRemoteSidePollInterval() const;
 
     static void remove(const std::string& name);
 

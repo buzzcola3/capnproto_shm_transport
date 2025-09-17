@@ -78,10 +78,14 @@ struct CpuUsageReport {
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "Usage:\n"
-                  << "  " << argv[0] << " --a   <seconds> <slotSize> <slotCount>        (burst)\n"
-                  << "  " << argv[0] << " --b   <seconds>                                (burst)\n"
-                  << "  " << argv[0] << " --a30 <seconds> <slotSize> <slotCount>         (30ms rate)\n"
-                  << "  " << argv[0] << " --b30 <seconds>                                 (30ms rate)\n";
+                  << "  " << argv[0] << " --a   <seconds> <slotSize> <slotCount> [localPollUs] [remotePollUs]        (burst)\n"
+                  << "  " << argv[0] << " --b   <seconds>                                [localPollUs] [remotePollUs] (burst)\n"
+                  << "  " << argv[0] << " --a30 <seconds> <slotSize> <slotCount> [localPollUs] [remotePollUs]       (30ms rate)\n"
+                  << "  " << argv[0] << " --b30 <seconds>                                [localPollUs] [remotePollUs] (30ms rate)\n"
+                  << "Notes:\n"
+                  << "  localPollUs  = microseconds idle sleep for THIS side's receive thread (default 1000)\n"
+                  << "  remotePollUs = microseconds idle sleep you request for the OTHER side (default unchanged)\n"
+                  << "  Use 0 to busy-spin (higher CPU, lower latency)\n";
         return 2;
     }
     std::string mode = argv[1];
@@ -94,11 +98,15 @@ int main(int argc, char** argv) {
     try {
         CpuUsageReport cpu;
         if (isA || isA30) {
-            if ((isA  && argc != 5) ||
-                (isA30 && argc != 5)) return 2;
+            // Args: --a / --a30 <seconds> <slotSize> <slotCount> [localPollUs] [remotePollUs]
+            if (argc < 5) return 2;
             long long seconds = std::stoll(argv[2]);
             uint64_t slotSize  = std::stoull(argv[3]);
             uint64_t slotCount = std::stoull(argv[4]);
+            uint64_t localPollUs  = (argc >= 6) ? std::stoull(argv[5]) : 1000;
+            bool haveRemote       = (argc >= 7);
+            uint64_t remotePollUs = haveRemote ? std::stoull(argv[6]) : 0; // 0 => leave as is unless explicitly 0
+
             if (seconds <= 0 || slotSize == 0 || (slotCount & (slotCount - 1))) {
                 std::cerr << "Invalid args\n"; return 2;
             }
@@ -106,11 +114,23 @@ int main(int argc, char** argv) {
 
             std::atomic<uint64_t> received{0};
             capnproto_shm_transport::ShmFixedSlotDuplexTransport transport(
-                kTransportName, slotSize, slotCount, true,
-                [&received](const uint8_t* d, uint64_t l) {
+                kTransportName,
+                slotSize,
+                slotCount,
+                [&received](const uint8_t* d, uint64_t l){
                     (void)d; (void)l;
                     received.fetch_add(1, std::memory_order_relaxed);
-                });
+                },
+                std::chrono::microseconds(localPollUs) // initial for side A
+            );
+
+            // If user wants to request remote (side B) poll interval change
+            if (haveRemote) {
+                transport.setRemoteSidePollInterval(std::chrono::microseconds(remotePollUs));
+            }
+
+            std::cout << "[info] A localPoll=" << transport.getLocalSidePollInterval().count()
+                      << "us remotePoll=" << transport.getRemoteSidePollInterval().count() << "us\n";
 
             std::vector<uint8_t> buf(slotSize);
             uint64_t seq = 0, sent = 0;
@@ -119,14 +139,12 @@ int main(int argc, char** argv) {
 
             cpu.begin();
             if (isA) {
-                // Burst mode
                 while (clock_type::now() < end) {
                     std::memcpy(buf.data(), &seq, sizeof(seq));
                     if (!transport.sendSlot(buf.data(), buf.size(), std::chrono::milliseconds{-1})) break;
                     ++seq; ++sent;
                 }
             } else {
-                // Rate-limited: 1 message every 30ms (best-effort)
                 auto nextSend = start;
                 while (clock_type::now() < end) {
                     auto now = clock_type::now();
@@ -135,7 +153,6 @@ int main(int argc, char** argv) {
                         if (!transport.sendSlot(buf.data(), buf.size(), std::chrono::milliseconds{-1})) break;
                         ++seq; ++sent;
                         nextSend += kMsgPeriod;
-                        // Catch up if behind (skip missed periods)
                         while (nextSend + kMsgPeriod < now) nextSend += kMsgPeriod;
                     }
                     std::this_thread::sleep_until(std::min(nextSend, end));
@@ -143,7 +160,7 @@ int main(int argc, char** argv) {
             }
 
             double elapsed = std::chrono::duration<double>(clock_type::now() - start).count();
-            std::cout << "role=" << (isA ? 'A' : 'A')
+            std::cout << "role=A"
                       << (isA30 ? " (30ms)" : " (burst)")
                       << " sent=" << sent
                       << " recv=" << received.load()
@@ -152,10 +169,14 @@ int main(int argc, char** argv) {
                       << "\n";
             cpu.end(elapsed, isA30 ? "A30" : "A");
             capnproto_shm_transport::ShmFixedSlotDuplexTransport::remove(kTransportName);
-        } else { // isB || isB30
-            if ((isB  && argc != 3) ||
-                (isB30 && argc != 3)) return 2;
+        } else {
+            // Args: --b / --b30 <seconds> [localPollUs] [remotePollUs]
+            if (argc < 3) return 2;
             long long seconds = std::stoll(argv[2]);
+            uint64_t localPollUs  = (argc >= 4) ? std::stoull(argv[3]) : 1000;
+            bool haveRemote       = (argc >= 5);
+            uint64_t remotePollUs = haveRemote ? std::stoull(argv[4]) : 0;
+
             if (seconds <= 0) return 2;
 
             std::atomic<uint64_t> received{0};
@@ -164,7 +185,16 @@ int main(int argc, char** argv) {
                 [&received](const uint8_t* d, uint64_t l) {
                     (void)d; (void)l;
                     received.fetch_add(1, std::memory_order_relaxed);
-                });
+                },
+                std::chrono::microseconds(localPollUs) // initial for side B
+            );
+
+            if (haveRemote) {
+                transport.setRemoteSidePollInterval(std::chrono::microseconds(remotePollUs));
+            }
+
+            std::cout << "[info] B localPoll=" << transport.getLocalSidePollInterval().count()
+                      << "us remotePoll=" << transport.getRemoteSidePollInterval().count() << "us\n";
 
             uint64_t slotSize = transport.slotSize();
             std::vector<uint8_t> buf(slotSize);
@@ -175,14 +205,12 @@ int main(int argc, char** argv) {
             auto end   = start + std::chrono::seconds(seconds);
 
             if (isB) {
-                // Burst
                 while (clock_type::now() < end) {
                     std::memcpy(buf.data(), &seq, sizeof(seq));
                     if (!transport.sendSlot(buf.data(), buf.size(), std::chrono::milliseconds{-1})) break;
                     ++seq; ++sent;
                 }
             } else {
-                // 30ms rate-limited
                 auto nextSend = start;
                 while (clock_type::now() < end) {
                     auto now = clock_type::now();
@@ -198,7 +226,7 @@ int main(int argc, char** argv) {
             }
 
             double elapsed = std::chrono::duration<double>(clock_type::now() - start).count();
-            std::cout << "role=" << (isB ? 'B' : 'B')
+            std::cout << "role=B"
                       << (isB30 ? " (30ms)" : " (burst)")
                       << " sent=" << sent
                       << " recv=" << received.load()

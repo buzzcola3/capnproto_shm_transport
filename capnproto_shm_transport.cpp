@@ -40,10 +40,21 @@ std::string version() { return "0.1.0"; }
 // ===================== Fixed-slot transport (Creator/Open) =====================
 namespace {
 inline void cpu_relax() {
-#if defined(__x86_64__) || defined(__i386__)
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#  if defined(_MSC_VER)
     _mm_pause();
+#  else
+    _mm_pause();
+#  endif
 #elif defined(__aarch64__)
+#  if defined(_MSC_VER)
+    __yield();
+#  else
     asm volatile("yield" ::: "memory");
+#  endif
+#else
+    // Fallback: cooperative yield
+    std::this_thread::yield();
 #endif
 }
 
@@ -53,12 +64,15 @@ struct alignas(64) SlotHeader {
     uint64_t slotMask{0};
     uint32_t shutdown{0};
     uint32_t ready{0};
-    uint8_t  _pad0[64 - (8+8+8+4+4)]; // fill first cache line (verify positive)
+    std::atomic<uint32_t> pollIntervalAUs{1000};
+    std::atomic<uint32_t> pollIntervalBUs{1000};
+    uint8_t  _pad0[64 - (8+8+8+4+4+4+4)];
     std::atomic<uint64_t> head{0};
     uint8_t  _pad1[64 - sizeof(std::atomic<uint64_t>)];
     std::atomic<uint64_t> tail{0};
     uint8_t  _pad2[64 - sizeof(std::atomic<uint64_t>)];
 };
+// Adjust expected size (3 cache lines = 192 bytes)
 static_assert(sizeof(SlotHeader) == 192, "SlotHeader size unexpected");
 
 struct SlotLayout {
@@ -83,6 +97,8 @@ SlotLayout create_region(bip::managed_shared_memory& shm,
     hdr->slotMask  = slotCount - 1;
     hdr->shutdown  = 0;
     hdr->ready     = 0;
+    hdr->pollIntervalAUs.store(1000, std::memory_order_relaxed);
+    hdr->pollIntervalBUs.store(1000, std::memory_order_relaxed);
     auto* buf = shm.construct<uint8_t>("buf")[slotSize * slotCount]();
     return {hdr, buf};
 }
@@ -140,27 +156,25 @@ uint32_t slot_read(SlotLayout lay, uint8_t* dst,
 
 struct ShmFixedSlotDuplexTransport::Impl {
     std::string name;
-    uint32_t creator{0};
+    uint32_t creator{0}; // side A if 1, side B if 0
     uint64_t slotSize{0};
     uint64_t slotCount{0};
     std::unique_ptr<bip::managed_shared_memory> seg_tx;
     std::unique_ptr<bip::managed_shared_memory> seg_rx;
     SlotLayout tx{};
     SlotLayout rx{};
-
     std::function<void(const uint8_t*, uint64_t)> callback;
     std::atomic<bool> running{false};
     std::thread worker;
-    std::chrono::microseconds pollInterval{std::chrono::milliseconds(1)}; // default 1ms
 
     Impl(const std::string& base,
          uint64_t sSize,
          uint64_t sCount,
          uint32_t truncate,
          std::function<void(const uint8_t*, uint64_t)> cb,
-         std::chrono::microseconds poll)
+         std::chrono::microseconds initialPoll)
         : name(base), creator(1), slotSize(sSize), slotCount(sCount),
-          callback(std::move(cb)), pollInterval(poll) {
+          callback(std::move(cb)) {
 
         std::string a2b = base + ".fs.a2b";
         std::string b2a = base + ".fs.b2a";
@@ -177,17 +191,19 @@ struct ShmFixedSlotDuplexTransport::Impl {
             bip::create_only, b2a.c_str(), alloc_bytes(sSize * sCount));
         tx = create_region(*seg_tx, slotSize, slotCount);
         rx = create_region(*seg_rx, slotSize, slotCount);
+        // Set A side poll interval in both headers (duplication)
+        tx.hdr->pollIntervalAUs.store(static_cast<uint32_t>(initialPoll.count()), std::memory_order_relaxed);
+        rx.hdr->pollIntervalAUs.store(static_cast<uint32_t>(initialPoll.count()), std::memory_order_relaxed);
         tx.hdr->ready = 1;
         rx.hdr->ready = 1;
-
         if (callback) startThread();
     }
 
     Impl(const std::string& base,
          std::chrono::milliseconds wait,
          std::function<void(const uint8_t*, uint64_t)> cb,
-         std::chrono::microseconds poll)
-        : name(base), creator(0), callback(std::move(cb)), pollInterval(poll) {
+         std::chrono::microseconds initialPoll)
+        : name(base), creator(0), callback(std::move(cb)) {
 
         std::string a2b = base + ".fs.a2b";
         std::string b2a = base + ".fs.b2a";
@@ -208,6 +224,9 @@ struct ShmFixedSlotDuplexTransport::Impl {
                 throw std::runtime_error("timeout opening shared memory transport");
             cpu_relax();
         }
+        // Set B side poll interval (both headers for symmetry)
+        rx.hdr->pollIntervalBUs.store(static_cast<uint32_t>(initialPoll.count()), std::memory_order_relaxed);
+        tx.hdr->pollIntervalBUs.store(static_cast<uint32_t>(initialPoll.count()), std::memory_order_relaxed);
         if (callback) startThread();
     }
 
@@ -225,7 +244,6 @@ struct ShmFixedSlotDuplexTransport::Impl {
         return true;
     }
 
-    // Simplified loop: light burst drain + fixed sleep (pollInterval) when idle.
     void runLoop() {
         while (running.load(std::memory_order_relaxed)) {
             bool delivered = false;
@@ -235,10 +253,17 @@ struct ShmFixedSlotDuplexTransport::Impl {
             }
             if (!running.load(std::memory_order_relaxed)) break;
             if (!delivered) {
-                if (pollInterval.count() > 0)
-                    std::this_thread::sleep_for(pollInterval);
-                else
+                uint32_t us;
+                if (creator) { // side A
+                    us = rx.hdr->pollIntervalAUs.load(std::memory_order_relaxed);
+                } else {       // side B
+                    us = rx.hdr->pollIntervalBUs.load(std::memory_order_relaxed);
+                }
+                if (us == 0) {
                     cpu_relax();
+                } else {
+                    std::this_thread::sleep_for(std::chrono::microseconds(us));
+                }
             }
         }
     }
@@ -247,7 +272,6 @@ struct ShmFixedSlotDuplexTransport::Impl {
         if (running.exchange(true)) return;
         worker = std::thread([this]{ runLoop(); });
     }
-
     void stopThread() {
         if (!running.exchange(false)) return;
         if (worker.joinable()) worker.join();
@@ -260,15 +284,18 @@ struct ShmFixedSlotDuplexTransport::Impl {
     }
 };
 
-// Updated constructors (no poll interval parameter)
+// Public API changes
 ShmFixedSlotDuplexTransport::ShmFixedSlotDuplexTransport(const std::string& name,
                                                          uint64_t slotSize,
                                                          uint64_t slotCount,
-                                                         uint32_t truncateOnCreate,
                                                          std::function<void(const uint8_t*, uint64_t)> callback,
-                                                         std::chrono::microseconds pollInterval)
-    : p_(new Impl(name, slotSize, slotCount, truncateOnCreate,
-                  std::move(callback), pollInterval)) {}
+                                                         std::chrono::microseconds initialPoll)
+    : p_(new Impl(name,
+                  slotSize,
+                  slotCount,
+                  /*forceTruncate=*/true,   // always truncate for side A
+                  std::move(callback),
+                  initialPoll)) {}
 
 ShmFixedSlotDuplexTransport::ShmFixedSlotDuplexTransport(Impl* impl) : p_(impl) {}
 
@@ -276,16 +303,16 @@ ShmFixedSlotDuplexTransport
 ShmFixedSlotDuplexTransport::open(const std::string& name,
                                   std::chrono::milliseconds wait,
                                   std::function<void(const uint8_t*, uint64_t)> callback,
-                                  std::chrono::microseconds pollInterval) {
+                                  std::chrono::microseconds initialPoll) {
     return ShmFixedSlotDuplexTransport(
-        new Impl(name, wait, std::move(callback), pollInterval));
+        new Impl(name, wait, std::move(callback), initialPoll));
 }
 
 ShmFixedSlotDuplexTransport::~ShmFixedSlotDuplexTransport() { delete p_; }
 
-ShmFixedSlotDuplexTransport::ShmFixedSlotDuplexTransport(ShmFixedSlotDuplexTransport&& o) noexcept : p_(o.p_) {
-    o.p_ = nullptr;
-}
+ShmFixedSlotDuplexTransport::ShmFixedSlotDuplexTransport(ShmFixedSlotDuplexTransport&& o) noexcept
+    : p_(o.p_) { o.p_ = nullptr; }
+
 ShmFixedSlotDuplexTransport&
 ShmFixedSlotDuplexTransport::operator=(ShmFixedSlotDuplexTransport&& o) noexcept {
     if (this != &o) { delete p_; p_ = o.p_; o.p_ = nullptr; }
@@ -331,6 +358,48 @@ uint64_t ShmFixedSlotDuplexTransport::slotCount() const noexcept {
 }
 uint32_t ShmFixedSlotDuplexTransport::isCreator() const noexcept {
     return p_ ? p_->creator : 0;
+}
+
+void ShmFixedSlotDuplexTransport::setLocalSidePollInterval(std::chrono::microseconds us) {
+    if (!p_ || !p_->rx.hdr || !p_->tx.hdr) return;
+    uint32_t v = static_cast<uint32_t>(us.count());
+    if (p_->creator) {
+        p_->rx.hdr->pollIntervalAUs.store(v, std::memory_order_relaxed);
+        p_->tx.hdr->pollIntervalAUs.store(v, std::memory_order_relaxed);
+    } else {
+        p_->rx.hdr->pollIntervalBUs.store(v, std::memory_order_relaxed);
+        p_->tx.hdr->pollIntervalBUs.store(v, std::memory_order_relaxed);
+    }
+}
+
+void ShmFixedSlotDuplexTransport::setRemoteSidePollInterval(std::chrono::microseconds us) {
+    if (!p_ || !p_->rx.hdr || !p_->tx.hdr) return;
+    uint32_t v = static_cast<uint32_t>(us.count());
+    if (p_->creator) {
+        // remote is B
+        p_->rx.hdr->pollIntervalBUs.store(v, std::memory_order_relaxed);
+        p_->tx.hdr->pollIntervalBUs.store(v, std::memory_order_relaxed);
+    } else {
+        // remote is A
+        p_->rx.hdr->pollIntervalAUs.store(v, std::memory_order_relaxed);
+        p_->tx.hdr->pollIntervalAUs.store(v, std::memory_order_relaxed);
+    }
+}
+
+std::chrono::microseconds ShmFixedSlotDuplexTransport::getLocalSidePollInterval() const {
+    if (!p_ || !p_->rx.hdr) return std::chrono::microseconds{0};
+    uint32_t v = p_->creator
+        ? p_->rx.hdr->pollIntervalAUs.load(std::memory_order_relaxed)
+        : p_->rx.hdr->pollIntervalBUs.load(std::memory_order_relaxed);
+    return std::chrono::microseconds{v};
+}
+
+std::chrono::microseconds ShmFixedSlotDuplexTransport::getRemoteSidePollInterval() const {
+    if (!p_ || !p_->rx.hdr) return std::chrono::microseconds{0};
+    uint32_t v = p_->creator
+        ? p_->rx.hdr->pollIntervalBUs.load(std::memory_order_relaxed)
+        : p_->rx.hdr->pollIntervalAUs.load(std::memory_order_relaxed);
+    return std::chrono::microseconds{v};
 }
 
 void ShmFixedSlotDuplexTransport::remove(const std::string& name) {
